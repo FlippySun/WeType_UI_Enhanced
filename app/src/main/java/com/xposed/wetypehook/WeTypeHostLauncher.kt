@@ -1,13 +1,17 @@
 package com.xposed.wetypehook
 
 import android.app.Activity
+import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.res.AssetManager
 import android.content.res.Configuration
 import android.content.res.Resources
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.net.Uri
+import android.os.Bundle
 import android.view.ContextThemeWrapper
 import android.view.ViewGroup
 import android.view.Window
@@ -16,6 +20,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.activity.ComponentDialog
 import androidx.compose.ui.platform.ComposeView
+import com.xposed.wetypehook.wetype.settings.WeTypeBackgroundImageStore
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import com.xposed.wetypehook.xposed.Log
 import java.util.WeakHashMap
@@ -23,12 +28,50 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 private const val MODULE_PACKAGE_NAME = "com.xposed.wetypehook"
+
+/*
+ * 2026-08-25
+ * Change type: add
+ * What: 由真实 WeType Activity 启动系统图片选择器，回传一次性 Uri，并在宿主销毁时清理寄生对话框。
+ * Why: 寄生设置的 ComponentDialog 不保证提供 ActivityResultRegistryOwner，直接复用宿主 Activity 可确保临时读取授权属于 WeType UID。
+ * Params & return: 输入宿主 Activity 与一次性回调，返回选择器是否成功启动或该结果是否被模块识别。
+ * Impact scope: 寄生设置页选图、Activity.dispatchActivityResult hook、Activity 生命周期与热重载清理。
+ * Risk: 仅占用一个由 ASCII "WT" 派生的 requestCode；同一进程只保留一个设置对话框，原 Activity 结果链仍会继续执行。
+ */
+private const val BACKGROUND_IMAGE_REQUEST_CODE = 0x5754
 private val activeHostDialogs = WeakHashMap<Activity, ComponentDialog>()
+private val backgroundImageResultCallbacks = WeakHashMap<Activity, (Uri?) -> Unit>()
+private val backgroundOperationsInProgress = WeakHashMap<Activity, Boolean>()
 private val moduleResourcesCache = HashMap<String, Resources>()
+private var lifecycleApplication: Application? = null
+
+private val hostActivityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+    override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+    override fun onActivityStarted(activity: Activity) = Unit
+    override fun onActivityResumed(activity: Activity) = Unit
+    override fun onActivityPaused(activity: Activity) = Unit
+    override fun onActivityStopped(activity: Activity) = Unit
+    override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+    override fun onActivityDestroyed(activity: Activity) {
+        WeTypeHostLauncher.onHostActivityDestroyed(activity)
+    }
+}
 
 object WeTypeHostLauncher {
     fun show(activity: Activity) {
-        activeHostDialogs[activity]?.takeIf { it.isShowing }?.let { return }
+        ensureActivityLifecycleCleanup(activity)
+        val existingEntry = synchronized(activeHostDialogs) {
+            activeHostDialogs.entries.firstOrNull { it.value.isShowing }
+        }
+        if (existingEntry != null) {
+            if (existingEntry.key === activity) return
+            val operationInProgress = synchronized(backgroundOperationsInProgress) {
+                backgroundOperationsInProgress[existingEntry.key] == true
+            }
+            if (operationInProgress) return
+            cleanupHostActivity(existingEntry.key, dismissDialog = true)
+        }
+        WeTypeBackgroundImageStore.discardStagedImageIfIdle(activity)
         WeTypeSettings.bindModuleBridgePendingIntent(
             ModuleBridgeContract.settingsBridgePendingIntent(activity.intent)
         )
@@ -53,6 +96,11 @@ object WeTypeHostLauncher {
             setCanceledOnTouchOutside(false)
             setOnDismissListener {
                 activeHostDialogs.remove(activity)
+                cancelBackgroundImageRequest(activity)
+                synchronized(backgroundOperationsInProgress) {
+                    backgroundOperationsInProgress.remove(activity)
+                }
+                WeTypeBackgroundImageStore.discardStagedImageIfIdle(activity)
                 WeTypeSettings.bindModuleBridgePendingIntent(null)
             }
         }
@@ -87,15 +135,97 @@ object WeTypeHostLauncher {
         }
     }
 
+    fun requestBackgroundImage(activity: Activity, onResult: (Uri?) -> Unit): Boolean {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        synchronized(backgroundImageResultCallbacks) {
+            backgroundImageResultCallbacks[activity] = onResult
+        }
+        val launched = runCatching {
+            @Suppress("DEPRECATION")
+            activity.startActivityForResult(intent, BACKGROUND_IMAGE_REQUEST_CODE)
+        }.onFailure { error ->
+            Log.e("Failed:Open WeType custom background picker")
+            Log.i(error)
+        }.isSuccess
+        if (!launched) cancelBackgroundImageRequest(activity)
+        return launched
+    }
+
+    fun dispatchBackgroundImageResult(
+        activity: Activity,
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?
+    ): Boolean {
+        if (requestCode != BACKGROUND_IMAGE_REQUEST_CODE) return false
+        val callback = synchronized(backgroundImageResultCallbacks) {
+            backgroundImageResultCallbacks.remove(activity)
+        } ?: return false
+        runCatching {
+            callback(data?.data.takeIf { resultCode == Activity.RESULT_OK })
+        }.onFailure { error ->
+            Log.e("Failed:Deliver WeType custom background picker result")
+            Log.i(error)
+        }
+        return true
+    }
+
+    fun setBackgroundOperationInProgress(activity: Activity, inProgress: Boolean) {
+        synchronized(backgroundOperationsInProgress) {
+            if (inProgress) {
+                backgroundOperationsInProgress[activity] = true
+            } else {
+                backgroundOperationsInProgress.remove(activity)
+            }
+        }
+        activeHostDialogs[activity]?.setCancelable(!inProgress)
+    }
+
+    fun isHostDialogShowing(activity: Activity): Boolean =
+        activeHostDialogs[activity]?.isShowing == true
+
+    fun cancelBackgroundImageRequest(activity: Activity) {
+        synchronized(backgroundImageResultCallbacks) {
+            backgroundImageResultCallbacks.remove(activity)
+        }
+    }
+
+    fun onHostActivityDestroyed(activity: Activity) {
+        val tracked = synchronized(activeHostDialogs) {
+            activeHostDialogs.containsKey(activity)
+        } || synchronized(backgroundImageResultCallbacks) {
+            backgroundImageResultCallbacks.containsKey(activity)
+        } || synchronized(backgroundOperationsInProgress) {
+            backgroundOperationsInProgress.containsKey(activity)
+        }
+        if (!tracked) return
+        cleanupHostActivity(activity, dismissDialog = true)
+    }
+
     fun prepareForHotReload(): Boolean {
         val cleaned = runOnMainThreadBlocking {
-            val dialogs = synchronized(activeHostDialogs) {
-                activeHostDialogs.values.toList().also { activeHostDialogs.clear() }
+            val dialogEntries = synchronized(activeHostDialogs) {
+                activeHostDialogs.entries.toList().also { activeHostDialogs.clear() }
             }
-            dialogs.forEach { dialog ->
+            dialogEntries.forEach { (activity, dialog) ->
                 dialog.setOnDismissListener(null)
                 if (dialog.isShowing) dialog.dismiss()
+                WeTypeBackgroundImageStore.discardStagedImageIfIdle(activity)
             }
+            synchronized(backgroundImageResultCallbacks) {
+                backgroundImageResultCallbacks.clear()
+            }
+            synchronized(backgroundOperationsInProgress) {
+                backgroundOperationsInProgress.clear()
+            }
+            lifecycleApplication?.unregisterActivityLifecycleCallbacks(
+                hostActivityLifecycleCallbacks
+            )
+            lifecycleApplication = null
         }
         if (cleaned) {
             WeTypeSettings.bindModuleBridgePendingIntent(null)
@@ -104,6 +234,28 @@ object WeTypeHostLauncher {
             }
         }
         return cleaned
+    }
+
+    private fun ensureActivityLifecycleCleanup(activity: Activity) {
+        val application = activity.application
+        if (lifecycleApplication === application) return
+        lifecycleApplication?.unregisterActivityLifecycleCallbacks(hostActivityLifecycleCallbacks)
+        application.registerActivityLifecycleCallbacks(hostActivityLifecycleCallbacks)
+        lifecycleApplication = application
+    }
+
+    private fun cleanupHostActivity(activity: Activity, dismissDialog: Boolean) {
+        val dialog = synchronized(activeHostDialogs) {
+            activeHostDialogs.remove(activity)
+        }
+        dialog?.setOnDismissListener(null)
+        if (dismissDialog && dialog?.isShowing == true) dialog.dismiss()
+        cancelBackgroundImageRequest(activity)
+        synchronized(backgroundOperationsInProgress) {
+            backgroundOperationsInProgress.remove(activity)
+        }
+        WeTypeBackgroundImageStore.discardStagedImageIfIdle(activity)
+        if (activeHostDialogs.isEmpty()) WeTypeSettings.bindModuleBridgePendingIntent(null)
     }
 
     private fun createEmbeddedModuleContext(activity: Activity): Context? {

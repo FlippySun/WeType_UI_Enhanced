@@ -15,7 +15,7 @@
     <string name="settings_save">Save changes</string>
     <string name="settings_reset">Restore defaults</string>
     <string name="settings_restart">Restart WeType</string>
-    <string name="settings_saved">Settings saved</string>
+    <string name="settings_saved">Settings saved. Restart WeType to apply.</string>
     <string name="settings_save_failed">Could not save settings</string>
     <string name="settings_invalid_color">Invalid color format. Please use #RRGGBB.</string>
     <string name="settings_root_required">Root permission is required</string>
@@ -63,6 +63,22 @@
     <string name="settings_toolbar_icon_bg_opacity_title">Toolbar icon bg opacity</string>
     <string name="settings_key_color_hook_alpha_title">Candidate background opacity</string>
     <string name="settings_custom_color">Custom background color</string>
+    <!--
+      2026-08-25
+      Change type: add
+      What: 新增背景图片选择、状态、清除和失败反馈文案。
+      Why: 设置状态必须通过文本表达，并为系统选择器及图片导入失败提供明确反馈。
+      Params & return: 无参数；由寄生设置页按当前草稿和保存结果读取。
+      Impact scope: 颜色设置卡片、预览和 Toast。
+      Risk: 无已知风险。
+    -->
+    <string name="settings_background_image_title">WeType background image</string>
+    <string name="settings_background_image_empty">Not set · shared by light and dark modes</string>
+    <string name="settings_background_image_selected">Set · shared by light and dark modes</string>
+    <string name="settings_background_image_clear">Clear background image</string>
+    <string name="settings_background_image_picker_failed">Could not open the image picker</string>
+    <string name="settings_background_image_read_failed">Could not read the selected image. Choose another image.</string>
+    <string name="settings_background_image_save_failed">Could not save the background image</string>
     <string name="settings_appearance_color_group_summary">%1$d mapped entries · default %2$s</string>
     <string name="settings_appearance_color_input_label">Group color</string>
     <string name="settings_light_key_color_title">Light mode key color</string>

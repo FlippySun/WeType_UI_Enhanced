@@ -1,6 +1,7 @@
 package com.xposed.wetypehook.wetype.hook
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.drawable.Drawable
@@ -17,6 +18,7 @@ import android.view.ViewTreeObserver
 import android.view.Window
 import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import androidx.core.graphics.drawable.toDrawable
 import com.xposed.wetypehook.xposed.Log
@@ -30,10 +32,12 @@ import com.xposed.wetypehook.xposed.loadClassOrNull
 import com.xposed.wetypehook.wetype.graphics.WeTypeBloomStrokeDrawable
 import com.xposed.wetypehook.wetype.graphics.WeTypeCornerRadii
 import com.xposed.wetypehook.wetype.graphics.createWeTypeContinuousRoundedPath
+import com.xposed.wetypehook.wetype.settings.WeTypeBackgroundImageStore
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 private const val WETYPE_BLUR_APPLY_MAX_RETRY = 6
@@ -79,7 +83,9 @@ internal object WeTypeWindowHooks {
         var blurApplyToken: Int = 0,
         var blurEligible: Boolean = false,
         var windowVisible: Boolean = false,
-        var backgroundCarrier: View? = null,
+        var backgroundCarrier: ImageView? = null,
+        var backgroundImageBitmap: Bitmap? = null,
+        var backgroundImageLoadAttempted: Boolean = false,
         var inputMethodService: Any? = null,
         var heightChangeListener: View.OnLayoutChangeListener? = null,
         var registeredViews: MutableList<View> = mutableListOf(),
@@ -130,6 +136,11 @@ internal object WeTypeWindowHooks {
     }
 
     private val weTypeWindowStates = WeakHashMap<Any, WeTypeWindowState>()
+
+    // 单线程解码避免多次 settle/layout 回调并发读取同一背景文件，也避免阻塞输入法首帧主线程。
+    // 该锁只协调热重载关闭与后续按需重建执行器，防止旧任务和新任务交叉提交。
+    private val backgroundImageDecodeExecutorLock = Any()
+    private var backgroundImageDecodeExecutor = Executors.newSingleThreadExecutor()
     private val overlayStateLock = Any()
     private val overlayRootsByContainer =
         WeakHashMap<ViewGroup, MutableMap<View, Boolean>>()
@@ -183,6 +194,9 @@ internal object WeTypeWindowHooks {
             }
         }
         if (cleaned) {
+            synchronized(backgroundImageDecodeExecutorLock) {
+                backgroundImageDecodeExecutor.shutdownNow()
+            }
             synchronized(weTypeWindowStates) {
                 weTypeWindowStates.clear()
             }
@@ -1267,7 +1281,7 @@ internal object WeTypeWindowHooks {
 
         carrier.visibility = View.VISIBLE
         applyContinuousCornerOutline(carrier, cornerRadii, state)
-        carrier.background = createBackgroundDrawable(carrier, context, cornerRadii)
+        applyBackgroundLayers(carrier, context, cornerRadii, state)
         setupHeightChangeListeners(inputMethodService, context, state)
     }
 
@@ -1322,14 +1336,15 @@ internal object WeTypeWindowHooks {
         decorGroup: ViewGroup,
         state: WeTypeWindowState,
         inputMethodService: Any
-    ): View {
+    ): ImageView {
         val existing = state.backgroundCarrier?.takeIf { it.parent === decorGroup }
         if (existing != null) return existing
 
-        val carrier = View(context).apply {
+        val carrier = ImageView(context).apply {
             isClickable = false
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            scaleType = ImageView.ScaleType.CENTER_CROP
         }
 
         decorGroup.addView(
@@ -1386,6 +1401,8 @@ internal object WeTypeWindowHooks {
         val carrier = state.backgroundCarrier ?: return
         carrier.visibility = View.GONE
         carrier.background = null
+        carrier.foreground = null
+        carrier.setImageDrawable(null)
         (carrier.layoutParams as? FrameLayout.LayoutParams)?.let { layoutParams ->
             layoutParams.width = ViewGroup.LayoutParams.MATCH_PARENT
             layoutParams.height = 0
@@ -1396,6 +1413,9 @@ internal object WeTypeWindowHooks {
 
     private fun removeBackgroundCarrier(state: WeTypeWindowState) {
         val carrier = state.backgroundCarrier ?: return
+        carrier.background = null
+        carrier.foreground = null
+        carrier.setImageDrawable(null)
         (carrier.parent as? ViewGroup)?.removeView(carrier)
         state.backgroundCarrier = null
         state.inputMethodService = null
@@ -1415,15 +1435,77 @@ internal object WeTypeWindowHooks {
         state.originalWindowBlurRadius = null
     }
 
-    private fun createBackgroundDrawable(targetView: View, context: Context, cornerRadii: WeTypeCornerRadii): Drawable {
+    /*
+     * 2026-08-25
+     * Change type: add
+     * What: 将背景 carrier 分为系统模糊、自定义图片、颜色蒙层和边缘高光四层，并异步加载图片。
+     * Why: 复用现有 carrier 的真实高度和圆角逻辑，ImageView.CENTER_CROP 可避免新增自绘缩放代码且保持原图比例。
+     * Params & return: 输入 carrier、WeType Context、圆角和窗口状态；直接更新图层，无返回值。
+     * Impact scope: 微信输入法主键盘、透明二级面板和窗口高度重算后的背景绘制。
+     * Risk: 图片缺失、损坏或解码失败时保留原有 blur、tint 与 bloom，不影响键盘交互。
+     */
+    private fun applyBackgroundLayers(
+        targetView: ImageView,
+        context: Context,
+        cornerRadii: WeTypeCornerRadii,
+        state: WeTypeWindowState
+    ) {
         val color = WeTypeSettings.getCurrentBackgroundColorXposed(context)
         val blurRadius = WeTypeSettings.getBlurRadiusXposed(context)
         val edgeHighlightEnabled = WeTypeSettings.isEdgeHighlightEnabledXposed(context)
         val edgeHighlightIntensity = WeTypeSettings.getEdgeHighlightIntensityXposed(context)
+        targetView.background = createInternalBackgroundBlurDrawable(
+            targetView,
+            blurRadius,
+            cornerRadii
+        )
+        targetView.setImageBitmap(state.backgroundImageBitmap)
+        targetView.foreground = createBackgroundForegroundDrawable(
+            context = context,
+            color = color,
+            cornerRadii = cornerRadii,
+            edgeHighlightEnabled = edgeHighlightEnabled,
+            edgeHighlightIntensity = edgeHighlightIntensity
+        )
+
+        if (state.backgroundImageLoadAttempted ||
+            !WeTypeBackgroundImageStore.hasStoredImage(context)
+        ) {
+            return
+        }
+        state.backgroundImageLoadAttempted = true
+        executeBackgroundImageDecode {
+            val bitmap = WeTypeBackgroundImageStore.loadStoredBitmap(context)
+            HookEnvironment.postTracked(targetView) {
+                state.backgroundImageBitmap = bitmap
+                if (bitmap != null &&
+                    state.windowVisible &&
+                    state.backgroundCarrier === targetView
+                ) {
+                    targetView.setImageBitmap(bitmap)
+                }
+            }
+        }
+    }
+
+    private fun executeBackgroundImageDecode(block: () -> Unit) {
+        synchronized(backgroundImageDecodeExecutorLock) {
+            if (backgroundImageDecodeExecutor.isShutdown) {
+                backgroundImageDecodeExecutor = Executors.newSingleThreadExecutor()
+            }
+            backgroundImageDecodeExecutor.execute(block)
+        }
+    }
+
+    private fun createBackgroundForegroundDrawable(
+        context: Context,
+        color: Int,
+        cornerRadii: WeTypeCornerRadii,
+        edgeHighlightEnabled: Boolean,
+        edgeHighlightIntensity: Int
+    ): Drawable {
         val tintDrawable = createTintDrawable(color, cornerRadii)
-        val blurDrawable = createInternalBackgroundBlurDrawable(targetView, blurRadius, cornerRadii)
         val layers = buildList {
-            blurDrawable?.also(::add)
             add(tintDrawable)
             if (edgeHighlightEnabled) {
                 add(

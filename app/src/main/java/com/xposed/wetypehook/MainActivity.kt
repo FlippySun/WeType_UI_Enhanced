@@ -55,6 +55,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.graphics.Color as ComposeColor
@@ -77,6 +78,7 @@ import com.xposed.wetypehook.wetype.graphics.createWeTypeContinuousRoundedPath
 import com.xposed.wetypehook.wetype.settings.DARK_KEY_COLOR_GROUP_ID
 import com.xposed.wetypehook.wetype.settings.LIGHT_KEY_COLOR_GROUP_ID
 import com.xposed.wetypehook.wetype.settings.WeTypeAppearanceColorGroups
+import com.xposed.wetypehook.wetype.settings.WeTypeBackgroundImageStore
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.BasicComponentDefaults
@@ -103,7 +105,9 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.theme.lightColorScheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 const val EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS = "com.xposed.wetypehook.extra.OPEN_WETYPE_EMBEDDED_SETTINGS"
@@ -409,11 +413,21 @@ private fun SyncSystemBars(darkMode: Boolean) {
 }
 
 @Composable
+/*
+ * 2026-08-25
+ * Change type: add
+ * What: 在寄生设置中加入背景图片选择、暂存预览、保存提交与恢复默认流程。
+ * Why: 图片必须由真实 WeType Activity 取得临时授权并写入同 UID 私有目录，不能经过模块 Bundle 或外部文件路径。
+ * Params & return: 输入宿主 settingsContext；无返回值，保存结果继续沿用现有异步 ACK 与 Toast 反馈。
+ * Impact scope: 颜色设置卡片、顶部效果预览、保存按钮和恢复默认操作。
+ * Risk: 选择取消或解码失败会保留已提交背景；只有设置 ACK 成功后才提交或删除图片。
+ */
 private fun WeTypeSettingsScreen(
     settingsContext: Context
 ) {
     val context = LocalContext.current
     val preferencesContext = remember(settingsContext) { settingsContext }
+    val hostActivity = remember(settingsContext) { settingsContext as? Activity }
     val isEmbeddedHost = remember(settingsContext) {
         (context.applicationContext ?: context).packageName != "com.xposed.wetypehook"
     }
@@ -452,6 +466,15 @@ private fun WeTypeSettingsScreen(
     var disableHotUpdate by rememberSaveable {
         mutableStateOf(snapshot.disableHotUpdate)
     }
+    var backgroundImageEnabled by rememberSaveable(preferencesContext) {
+        mutableStateOf(WeTypeBackgroundImageStore.hasStoredImage(preferencesContext))
+    }
+    var backgroundImageDirty by rememberSaveable { mutableStateOf(false) }
+    var hasStagedBackgroundImage by rememberSaveable { mutableStateOf(false) }
+    var backgroundPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var backgroundImageRequestGeneration by remember { mutableIntStateOf(0) }
+    var isImportingBackgroundImage by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
     val appearanceGroupColors = rememberSaveable(
         saver = listSaver(
             save = { it.toList() },
@@ -470,6 +493,22 @@ private fun WeTypeSettingsScreen(
     }
     var alphaValue by rememberSaveable {
         mutableIntStateOf(Color.alpha(if (currentModeIsDark) darkColor else lightColor))
+    }
+
+    LaunchedEffect(
+        preferencesContext,
+        backgroundImageEnabled,
+        hasStagedBackgroundImage
+    ) {
+        backgroundPreviewBitmap = if (!backgroundImageEnabled) {
+            null
+        } else withContext(Dispatchers.IO) {
+            if (hasStagedBackgroundImage) {
+                WeTypeBackgroundImageStore.loadStagedPreview(preferencesContext)
+            } else {
+                WeTypeBackgroundImageStore.loadStoredPreview(preferencesContext)
+            }
+        }
     }
 
     fun currentColor(): Int = if (currentModeIsDark) darkColor else lightColor
@@ -503,8 +542,87 @@ private fun WeTypeSettingsScreen(
         return appearanceGroupColors[groupIndex(group.id)]
     }
 
+    fun selectBackgroundImage() {
+        if (isSaving || isImportingBackgroundImage) return
+        val activity = hostActivity
+        if (activity == null) {
+            Toast.makeText(
+                context,
+                R.string.settings_background_image_picker_failed,
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        backgroundImageRequestGeneration++
+        val requestGeneration = backgroundImageRequestGeneration
+        isImportingBackgroundImage = true
+        val launched = WeTypeHostLauncher.requestBackgroundImage(activity) { uri ->
+            if (backgroundImageRequestGeneration != requestGeneration) {
+                return@requestBackgroundImage
+            }
+            if (uri == null) {
+                isImportingBackgroundImage = false
+                return@requestBackgroundImage
+            }
+            WeTypeHostLauncher.setBackgroundOperationInProgress(activity, true)
+            WeTypeBackgroundImageStore.stageImageAsync(preferencesContext, uri) { preview ->
+                if (backgroundImageRequestGeneration != requestGeneration) {
+                    return@stageImageAsync
+                }
+                isImportingBackgroundImage = false
+                WeTypeHostLauncher.setBackgroundOperationInProgress(activity, false)
+                if (!WeTypeHostLauncher.isHostDialogShowing(activity)) {
+                    return@stageImageAsync
+                }
+                if (preview == null) {
+                    Toast.makeText(
+                        context,
+                        R.string.settings_background_image_read_failed,
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@stageImageAsync
+                }
+                backgroundPreviewBitmap = preview
+                backgroundImageEnabled = true
+                backgroundImageDirty = true
+                hasStagedBackgroundImage = true
+            }
+        }
+        if (!launched) {
+            backgroundImageRequestGeneration++
+            isImportingBackgroundImage = false
+            Toast.makeText(
+                context,
+                R.string.settings_background_image_picker_failed,
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    fun clearBackgroundImage() {
+        if (isSaving || isImportingBackgroundImage) return
+        backgroundImageRequestGeneration++
+        WeTypeBackgroundImageStore.discardStagedImage(preferencesContext)
+        backgroundPreviewBitmap = null
+        backgroundImageEnabled = false
+        backgroundImageDirty = true
+        hasStagedBackgroundImage = false
+    }
+
     fun saveSettings(successMessage: Int = R.string.settings_saved): Boolean {
-        return WeTypeSettings.save(
+        if (isSaving || isImportingBackgroundImage) return false
+        backgroundImageRequestGeneration++
+        isSaving = true
+        hostActivity?.let { WeTypeHostLauncher.setBackgroundOperationInProgress(it, true) }
+        if (!WeTypeBackgroundImageStore.beginSaveTransaction()) {
+            isSaving = false
+            hostActivity?.let { WeTypeHostLauncher.setBackgroundOperationInProgress(it, false) }
+            return false
+        }
+        val imageEnabledAtSave = backgroundImageEnabled
+        val imageDirtyAtSave = backgroundImageDirty
+        val stagedImageAtSave = hasStagedBackgroundImage
+        val started = WeTypeSettings.save(
             context = preferencesContext,
             lightColor = lightColor,
             darkColor = darkColor,
@@ -523,16 +641,43 @@ private fun WeTypeSettingsScreen(
             appearanceColors = currentAppearanceColors(),
             disableHotUpdate = disableHotUpdate,
             onPersisted = { saved ->
-                Toast.makeText(
-                    context,
-                    if (saved) successMessage else R.string.settings_save_failed,
-                    Toast.LENGTH_SHORT
-                ).show()
+                WeTypeBackgroundImageStore.persistDraftAsync(
+                    context = preferencesContext,
+                    settingsSaved = saved,
+                    imageDirty = imageDirtyAtSave,
+                    imageEnabled = imageEnabledAtSave,
+                    stagedImage = stagedImageAtSave
+                ) { imageSaved ->
+                    hostActivity?.let {
+                        WeTypeHostLauncher.setBackgroundOperationInProgress(it, false)
+                    }
+                    val screenVisible = hostActivity?.let {
+                        WeTypeHostLauncher.isHostDialogShowing(it)
+                    } ?: true
+                    if (!screenVisible) return@persistDraftAsync
+                    if (saved && imageSaved) {
+                        backgroundImageDirty = false
+                        hasStagedBackgroundImage = false
+                    }
+                    isSaving = false
+                    Toast.makeText(
+                        context,
+                        when {
+                            !saved -> R.string.settings_save_failed
+                            !imageSaved -> R.string.settings_background_image_save_failed
+                            else -> successMessage
+                        },
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
             }
         )
+        return started
     }
 
     fun restoreDefaults() {
+        if (isSaving || isImportingBackgroundImage) return
+        backgroundImageRequestGeneration++
         lightColor = WeTypeSettings.DEFAULT_LIGHT_COLOR
         darkColor = WeTypeSettings.DEFAULT_DARK_COLOR
         blurRadius = WeTypeSettings.DEFAULT_BLUR_RADIUS
@@ -547,6 +692,11 @@ private fun WeTypeSettingsScreen(
         candidatePinyinLeftMarginDp = WeTypeSettings.DEFAULT_CANDIDATE_PINYIN_LEFT_MARGIN_DP.toString()
         toolbarIconBgOpacity = WeTypeSettings.DEFAULT_TOOLBAR_ICON_BG_OPACITY
         disableHotUpdate = WeTypeSettings.DEFAULT_DISABLE_HOT_UPDATE
+        WeTypeBackgroundImageStore.discardStagedImage(preferencesContext)
+        backgroundPreviewBitmap = null
+        backgroundImageEnabled = false
+        backgroundImageDirty = true
+        hasStagedBackgroundImage = false
         appearanceGroups.forEachIndexed { index, group ->
             appearanceGroupColors[index] = group.defaultColor
         }
@@ -587,7 +737,8 @@ private fun WeTypeSettingsScreen(
                 },
                 actions = {
                     IconButton(
-                        onClick = { saveSettings() }
+                        onClick = { saveSettings() },
+                        enabled = !isSaving && !isImportingBackgroundImage
                     ) {
                         Icon(
                             imageVector = MiuixIcons.Ok,
@@ -605,6 +756,11 @@ private fun WeTypeSettingsScreen(
                         edgeHighlightIntensity = edgeHighlightIntensity,
                         lightKeyColor = keyColorValue(false),
                         darkKeyColor = keyColorValue(true),
+                        backgroundImage = if (backgroundImageEnabled) {
+                            backgroundPreviewBitmap
+                        } else {
+                            null
+                        },
                         isDark = currentModeIsDark
                     )
                 }
@@ -718,6 +874,35 @@ private fun WeTypeSettingsScreen(
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
+
+                        HorizontalDivider()
+
+                        ArrowPreference(
+                            title = stringResource(R.string.settings_background_image_title),
+                            summary = stringResource(
+                                if (backgroundImageEnabled) {
+                                    R.string.settings_background_image_selected
+                                } else {
+                                    R.string.settings_background_image_empty
+                                }
+                            ),
+                            onClick = ::selectBackgroundImage,
+                            enabled = !isSaving && !isImportingBackgroundImage
+                        )
+
+                        if (backgroundImageEnabled) {
+                            HorizontalDivider()
+                            BasicComponent(
+                                title = stringResource(R.string.settings_background_image_clear),
+                                titleColor = BasicComponentDefaults.titleColor(
+                                    color = MiuixTheme.colorScheme.primary
+                                ),
+                                onClick = ::clearBackgroundImage,
+                                enabled = !isSaving && !isImportingBackgroundImage
+                            )
+                        }
+
+                        HorizontalDivider()
 
                         val currentKeyGroup = keyColorGroup(currentModeIsDark)
                         val currentKeyGroupIndex = groupIndex(currentKeyGroup.id)
@@ -884,7 +1069,8 @@ private fun WeTypeSettingsScreen(
                         ArrowPreference(
                             title = stringResource(R.string.settings_reset_title),
                             summary = stringResource(R.string.settings_reset_desc),
-                            onClick = ::restoreDefaults
+                            onClick = ::restoreDefaults,
+                            enabled = !isSaving && !isImportingBackgroundImage
                         )
 
                         HorizontalDivider()
@@ -897,7 +1083,7 @@ private fun WeTypeSettingsScreen(
                             onClick = {
                                 val intent = Intent(
                                     Intent.ACTION_VIEW,
-                                    Uri.parse("https://github.com/NEORUAA/MIUI_IME_Unlock")
+                                    Uri.parse("https://github.com/FlippySun/WeType_UI_Enhanced")
                                 )
                                 context.startActivity(intent)
                             }
@@ -950,6 +1136,7 @@ private fun PreviewSection(
     edgeHighlightIntensity: Int,
     lightKeyColor: Int,
     darkKeyColor: Int,
+    backgroundImage: Bitmap?,
     isDark: Boolean
 ) {
     Column(
@@ -984,6 +1171,7 @@ private fun PreviewSection(
                         edgeHighlightIntensity = edgeHighlightIntensity,
                         lightKeyColor = lightKeyColor,
                         darkKeyColor = darkKeyColor,
+                        backgroundImage = backgroundImage,
                         isDark = isDark
                     )
                 }
@@ -1002,6 +1190,7 @@ private fun PreviewCard(
     edgeHighlightIntensity: Int,
     lightKeyColor: Int,
     darkKeyColor: Int,
+    backgroundImage: Bitmap?,
     isDark: Boolean
 ) {
     val context = LocalContext.current
@@ -1046,14 +1235,23 @@ private fun PreviewCard(
                     )
                     .clip(previewShape)
             ) {
-                Image(
-                    painter = painterResource(R.drawable.natural_texture_004),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .matchParentSize()
-                        .blur((blurRadius / 3f).coerceAtLeast(0f).dp)
-                )
+                if (backgroundImage != null) {
+                    Image(
+                        bitmap = backgroundImage.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.matchParentSize()
+                    )
+                } else {
+                    Image(
+                        painter = painterResource(R.drawable.natural_texture_004),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .matchParentSize()
+                            .blur((blurRadius / 3f).coerceAtLeast(0f).dp)
+                    )
+                }
                 Box(
                     modifier = Modifier
                         .matchParentSize()
