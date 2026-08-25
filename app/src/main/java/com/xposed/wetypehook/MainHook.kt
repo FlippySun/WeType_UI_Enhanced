@@ -2,6 +2,7 @@ package com.xposed.wetypehook
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.res.AssetManager
 import android.content.res.Configuration
 import android.content.res.Resources
@@ -20,6 +21,7 @@ import android.view.inputmethod.InputMethodManager
 import com.xposed.wetypehook.wetype.hook.WeTypeResourceHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeUpdateHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeWindowHooks
+import com.xposed.wetypehook.wetype.settings.WeTypeBackgroundImageStore
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import com.xposed.wetypehook.xposed.HookEnvironment
 import com.xposed.wetypehook.xposed.Log
@@ -175,8 +177,22 @@ class MainHook : XposedModule() {
 
     override fun onHotReloading(param: HotReloadingParam): Boolean {
         param.setSavedInstanceState(activeTargetsBundle())
-        HookEnvironment.prepareForHotReload()
+        /*
+         * 2026-08-25
+         * Change type: fix
+         * What: 热重载前等待自定义背景文件队列安全结束并释放旧执行线程。
+         * Why: 模块启用了 autoHotReload，遗留单线程执行器会持续持有旧 classloader 和图片缓存。
+         * Params & return: 无输入参数；返回旧背景存储队列是否在超时前完全结束。
+         * Impact scope: LSPosed 热重载清理，不改变普通选图、保存或窗口渲染路径。
+         * Risk: 存在待处理事务或空闲线程退出超时时会拒绝本次热重载，已提交背景文件保持不变。
+         */
+        val backgroundStoreClean = WeTypeBackgroundImageStore.prepareForHotReload()
+        if (!backgroundStoreClean) {
+            Log.e("Reject hot reload because a background image transaction is still pending")
+            return false
+        }
 
+        HookEnvironment.prepareForHotReload()
         val hostClean = WeTypeHostLauncher.prepareForHotReload()
         val windowClean = WeTypeWindowHooks.prepareForHotReload()
         val resourcesClean = runOnMainThreadBlocking {
@@ -306,6 +322,7 @@ class MainHook : XposedModule() {
         HookEnvironment.withHookScope("wetype.window-blur") { hookWeTypeWindowBlur() }
         HookEnvironment.withHookScope("wetype.window-corner") { hookWeTypeWindowCorner() }
         HookEnvironment.withHookScope("wetype.disable-update") { hookWeTypeDisableHotUpdate() }
+        HookEnvironment.withHookScope("wetype.background-picker-result") { hookWeTypeBackgroundPickerResult() }
         HookEnvironment.withHookScope("wetype.intent-entry") { hookWeTypeIntentEntry() }
         HookEnvironment.withHookScope("wetype.about-entry") { hookWeTypeAboutLogoEntry() }
         HookEnvironment.withHookScope("wetype.keyboard-logo") { WeTypeResourceHooks.hookKeyboardLogo() }
@@ -680,6 +697,47 @@ class MainHook : XposedModule() {
 
     private fun hookWeTypeWindowBlur() {
         WeTypeWindowHooks.hookWindowBlur()
+    }
+
+    /*
+     * 2026-08-25
+     * Change type: add
+     * What: Hook API 31-37 的 Activity.dispatchActivityResult 重载并转发自定义背景选图结果。
+     * Why: 框架分发入口一定先于宿主 onActivityResult，避免依赖腾讯 Activity 是否继承 ComponentActivity 或调用 super。
+     * Params & return: 读取 requestCode、resultCode 与 Intent，不修改原方法参数和返回值。
+     * Impact scope: 仅处理 WeTypeHostLauncher 已登记的选图请求，其他 Activity 结果继续走原始分发链。
+     * Risk: Android 私有方法签名未来可能变化；找不到兼容重载时只禁用选图，不影响现有输入法 Hook。
+     */
+    private fun hookWeTypeBackgroundPickerResult() {
+        runCatching {
+            val resultDispatchMethods = Activity::class.java.declaredMethods.filter { method ->
+                val parameterTypes = method.parameterTypes
+                method.name == "dispatchActivityResult" &&
+                    parameterTypes.size >= 4 &&
+                    parameterTypes[0] == String::class.java &&
+                    parameterTypes[1] == Int::class.javaPrimitiveType &&
+                    parameterTypes[2] == Int::class.javaPrimitiveType &&
+                    parameterTypes[3] == Intent::class.java
+            }
+            check(resultDispatchMethods.isNotEmpty()) {
+                "No compatible Activity.dispatchActivityResult overload"
+            }
+            resultDispatchMethods.forEach { method ->
+                method.hookBefore { param ->
+                    val activity = param.thisObject as? Activity ?: return@hookBefore
+                    WeTypeHostLauncher.dispatchBackgroundImageResult(
+                        activity = activity,
+                        requestCode = param.args[1] as Int,
+                        resultCode = param.args[2] as Int,
+                        data = param.args[3] as? Intent
+                    )
+                }
+            }
+            Log.i("Success: Hook WeType custom background picker result")
+        }.onFailure { error ->
+            Log.e("Failed:Hook WeType custom background picker result")
+            Log.i(error)
+        }
     }
 
     private fun hookWeTypeIntentEntry() {

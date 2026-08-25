@@ -9,12 +9,21 @@ android {
     compileSdk = 37
     namespace = "com.xposed.wetypehook"
 
+    /*
+     * 2026-08-25
+     * Change type: config
+     * What: 将自定义背景图片功能版本提升到 1.28.0（versionCode 34）。
+     * Why: 与上游 1.27.1 安装包明确区分，并允许在保留现有模块数据的前提下覆盖升级。
+     * Params & return: 影响 APK versionCode 与 versionName，无运行时参数或返回值。
+     * Impact scope: 构建产物文件名、Android 包管理器升级判断和发布标识。
+     * Risk: 无已知风险。
+     */
     defaultConfig {
         applicationId = "com.xposed.wetypehook"
         minSdk = 31
         targetSdk = 37
-        versionCode = 33
-        versionName = "1.27.1"
+        versionCode = 34
+        versionName = "1.28.0"
     }
 
     buildTypes {
