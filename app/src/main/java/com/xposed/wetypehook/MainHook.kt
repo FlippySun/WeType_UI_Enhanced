@@ -13,11 +13,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
+import android.widget.TextView
 import com.xposed.wetypehook.wetype.hook.WeTypeResourceHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeUpdateHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeWindowHooks
@@ -45,6 +48,8 @@ import io.github.libxposed.api.XposedModuleInterface.HotReloadingParam
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam
+import io.github.libxposed.service.XposedService
+import io.github.libxposed.service.XposedServiceHelper
 import org.luckypray.dexkit.DexKitBridge
 import java.lang.reflect.Field
 import java.lang.reflect.Method
@@ -83,7 +88,7 @@ private val WETYPE_COLOR_REPLACEMENTS = mapOf(
     "ime_skin_dark_keyboard_end_color" to Color.TRANSPARENT,
     "ime_skin_keyboard_end_color" to Color.TRANSPARENT
 )
-class MainHook : XposedModule() {
+class MainHook : XposedModule(), XposedServiceHelper.OnServiceListener {
     private val miuiImeList = setOf(
         "com.iflytek.inputmethod.miui",
         "com.sohu.inputmethod.sogou.xiaomi",
@@ -109,6 +114,7 @@ class MainHook : XposedModule() {
     private var viewListenerInfoField: Field? = null
     private var onClickListenerField: Field? = null
     private val originalAboutLogoStates = WeakHashMap<View, AboutLogoState>()
+    private val originalAboutPluginEntryStates = WeakHashMap<TextView, AboutPluginEntryState>()
 
     private val activeTargets = LinkedHashMap<String, ActiveTarget>()
 
@@ -123,15 +129,76 @@ class MainHook : XposedModule() {
         val isClickable: Boolean
     )
 
+    /*
+     * 2026-08-26
+     * Change type: add
+     * What: 保存微信输入法 3.5.2「关于」页隐藏官网文本控件的原始状态，供 NPatch 内嵌版显示双语功能入口并在刷新或热重载时完整恢复。
+     * Why: 复用宿主已有控件比修改闭源资源或动态插入新布局更稳定，也避免破坏页面约束关系。
+     * Params & return: 状态对象无运行时参数或返回值；记录文本、可见性、可访问交互、字号、最小高度、对齐与点击监听器。
+     * Impact scope: 仅影响 NPatch 内嵌模式下的 ImeAboutActivity；独立 LSPosed 模式仍保留原 Logo 入口。
+     * Risk: 微信输入法升级并移除 official_website 字段时入口不会注入，但原关于页和隐藏 Logo 入口不受影响。
+     */
+    private data class AboutPluginEntryState(
+        val text: CharSequence?,
+        val visibility: Int,
+        val isClickable: Boolean,
+        val isFocusable: Boolean,
+        val textSizePx: Float,
+        val minimumHeight: Int,
+        val gravity: Int,
+        val clickListener: View.OnClickListener?
+    )
+
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         HookEnvironment.attach(this, null, TAG)
         modulePath = moduleApplicationInfo.sourceDir
         ModuleRuntime.updateModuleApkPath(modulePath)
+        /*
+         * 2026-08-26
+         * Change type: config
+         * What: 在 NPatch 框架中注册 service listener，并把内嵌状态保持为未确认，直到 Integrated loader 投递专用 service。
+         * Why: NPatch Local 与 Integrated 都报告 frameworkName=NPatch，不能仅凭框架名称开启单包逻辑。
+         * Params & return: 输入当前 frameworkName 决定是否监听；无返回值。
+         * Impact scope: 当前进程的设置同步、应用内入口和激活心跳策略。
+         * Risk: 第三方 NPatch 分支若不投递 Integrated service 将回退到独立模块兼容路径。
+         */
+        ModuleRuntime.updateEmbeddedHostMode(false)
+        if (frameworkName.equals("NPatch", ignoreCase = true)) {
+            XposedServiceHelper.registerListener(this)
+        }
         Log.i(
             "Loaded in ${param.processName}: $frameworkName $frameworkVersion " +
                 "($frameworkVersionCode), API $apiVersion, properties=0x${frameworkProperties.toString(16)}"
         )
 
+    }
+
+    /*
+     * 2026-08-26
+     * Change type: add
+     * What: 接收 NPatch 在模块初始化后注入的可写 XposedService，并将其 RemotePreferences 绑定到现有设置层。
+     * Why: XposedInterface.getRemotePreferences 仅供目标进程读取；内嵌设置保存必须通过 service API 写入 NPatch 的共享偏好数据库。
+     * Params & return: onServiceBind/onServiceDied 接收当前 XposedService；无返回值，分别绑定或释放设置存储。
+     * Impact scope: NPatch 内嵌模式的设置跨进程保存和重启恢复；独立 LSPosed 模块继续由 ModuleApplication 绑定 service。
+     * Risk: 若第三方 NPatch 未投递 service，将回退为微信输入法本地偏好并在各进程启动时载入。
+     */
+    override fun onServiceBind(service: XposedService) {
+        runCatching {
+            if (!service.frameworkName.equals("NPatch", ignoreCase = true)) return
+            WeTypeSettings.bindRemotePreferences(
+                service.getRemotePreferences(WeTypeSettings.PREF_GROUP)
+            )
+            ModuleRuntime.updateEmbeddedHostMode(true)
+        }.onFailure { error ->
+            Log.e("Failed:Bind writable NPatch remote preferences")
+            Log.i(error)
+        }
+    }
+
+    override fun onServiceDied(service: XposedService) {
+        if (!ModuleRuntime.isEmbeddedHostMode()) return
+        WeTypeSettings.unbindRemotePreferences()
+        Log.i("Writable NPatch remote preferences service disconnected")
     }
 
     override fun onSystemServerStarting(param: SystemServerStartingParam) {
@@ -212,6 +279,11 @@ class MainHook : XposedModule() {
         HookEnvironment.attach(this, null, TAG)
         modulePath = moduleApplicationInfo.sourceDir
         ModuleRuntime.updateModuleApkPath(modulePath)
+        // NPatch Integrated 不支持热重载；新代先清除状态，避免 Local 模式继承旧代误判。
+        ModuleRuntime.updateEmbeddedHostMode(false)
+        if (frameworkName.equals("NPatch", ignoreCase = true)) {
+            XposedServiceHelper.registerListener(this)
+        }
         val targets = (param.savedInstanceState as? Bundle).toActiveTargets()
         synchronized(activeTargets) {
             activeTargets.clear()
@@ -295,7 +367,10 @@ class MainHook : XposedModule() {
     }
 
     private fun installWeTypeHooks(sourcePackage: String) {
-        if (frameworkProperties and XposedInterface.PROP_CAP_REMOTE != 0L) {
+        if (
+            !ModuleRuntime.isEmbeddedHostMode() &&
+            frameworkProperties and XposedInterface.PROP_CAP_REMOTE != 0L
+        ) {
             runCatching {
                 WeTypeSettings.bindRemotePreferences(
                     getRemotePreferences(WeTypeSettings.PREF_GROUP)
@@ -304,7 +379,7 @@ class MainHook : XposedModule() {
                 Log.e("Remote preferences are unavailable; WeType hooks use defaults")
                 Log.i(error)
             }
-        } else {
+        } else if (!ModuleRuntime.isEmbeddedHostMode()) {
             Log.i("Remote preferences are unavailable; WeType hooks use defaults")
         }
 
@@ -638,6 +713,8 @@ class MainHook : XposedModule() {
     }
 
     private fun notifyActivationHeartbeat(context: Context, sourcePackage: String) {
+        // NPatch 单包内没有独立模块包，跨包心跳既无法落盘，也不影响已显示的寄生设置入口。
+        if (ModuleRuntime.isEmbeddedHostMode()) return
         ModuleActivationTracker.notifyActivationFromHook(
             context = context,
             sourcePackage = sourcePackage,
@@ -770,6 +847,20 @@ class MainHook : XposedModule() {
                 activity.window?.decorView?.let { decorView ->
                     HookEnvironment.postTracked(decorView) {
                         hookWeTypeAboutLogoClick(activity)
+                        if (ModuleRuntime.isEmbeddedHostMode()) {
+                            hookWeTypeAboutPluginEntry(activity)
+                        }
+                    }
+                }
+            }
+            findMethod(WETYPE_ABOUT_ACTIVITY) {
+                name == "f1" && parameterTypes.isEmpty()
+            }.hookAfter { param ->
+                if (!ModuleRuntime.isEmbeddedHostMode()) return@hookAfter
+                val activity = param.thisObject as? Activity ?: return@hookAfter
+                activity.window?.decorView?.let { decorView ->
+                    HookEnvironment.postTracked(decorView) {
+                        hookWeTypeAboutPluginEntry(activity)
                     }
                 }
             }
@@ -803,6 +894,46 @@ class MainHook : XposedModule() {
             }
         }.onFailure {
             Log.e("Failed:Attach WeType about logo click hook")
+            Log.i(it)
+        }
+    }
+
+    private fun hookWeTypeAboutPluginEntry(activity: Activity) {
+        runCatching {
+            val resourceIds = loadClassOrNull("com.tencent.wetype.plugin.hld.s") ?: return
+            val entryId = resourceIds.getField("official_website").getInt(null)
+            val entryView = activity.findViewById<TextView>(entryId) ?: return
+            if (!originalAboutPluginEntryStates.containsKey(entryView)) {
+                originalAboutPluginEntryStates[entryView] = AboutPluginEntryState(
+                    text = entryView.text,
+                    visibility = entryView.visibility,
+                    isClickable = entryView.isClickable,
+                    isFocusable = entryView.isFocusable,
+                    textSizePx = entryView.textSize,
+                    minimumHeight = entryView.minimumHeight,
+                    gravity = entryView.gravity,
+                    clickListener = resolveOnClickListener(entryView)
+                )
+            }
+
+            val entryLabel = if (
+                activity.resources.configuration.locales[0].language == "zh"
+            ) {
+                "插件与自定义背景"
+            } else {
+                "Plugin & custom background"
+            }
+            entryView.text = entryLabel
+            entryView.visibility = View.VISIBLE
+            entryView.isClickable = true
+            entryView.isFocusable = true
+            // 16sp 匹配关于页功能正文，48dp 遵循 Android 可触控目标的最低高度。
+            entryView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            entryView.minimumHeight = (48f * activity.resources.displayMetrics.density).toInt()
+            entryView.gravity = Gravity.CENTER_VERTICAL
+            entryView.setOnClickListener { WeTypeHostLauncher.show(activity) }
+        }.onFailure {
+            Log.e("Failed:Attach visible WeType plugin entry")
             Log.i(it)
         }
     }
@@ -1154,6 +1285,9 @@ class MainHook : XposedModule() {
             currentProcessActivities().forEach { activity ->
                 if (activity.javaClass.name == WETYPE_ABOUT_ACTIVITY) {
                     hookWeTypeAboutLogoClick(activity)
+                    if (ModuleRuntime.isEmbeddedHostMode()) {
+                        hookWeTypeAboutPluginEntry(activity)
+                    }
                 }
                 val intent = activity.intent ?: return@forEach
                 if (!intent.getBooleanExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, false)) {
@@ -1243,6 +1377,16 @@ class MainHook : XposedModule() {
             view.isClickable = state.isClickable
             view.setTag(WETYPE_ABOUT_LOGO_TAG_KEY, null)
         }
+        originalAboutPluginEntryStates.forEach { (view, state) ->
+            view.text = state.text
+            view.visibility = state.visibility
+            view.isClickable = state.isClickable
+            view.isFocusable = state.isFocusable
+            view.setTextSize(TypedValue.COMPLEX_UNIT_PX, state.textSizePx)
+            view.minimumHeight = state.minimumHeight
+            view.gravity = state.gravity
+            view.setOnClickListener(state.clickListener)
+        }
 
         imeInputFrameLayoutListeners.clear()
         monitoredImeInputFrames.clear()
@@ -1251,6 +1395,7 @@ class MainHook : XposedModule() {
         adjustedImeContentViews.clear()
         miuiBottomFrameViews.clear()
         originalAboutLogoStates.clear()
+        originalAboutPluginEntryStates.clear()
         installedHookTokens.clear()
         navBarColor = null
         bottomViewSourceColor = null

@@ -76,16 +76,28 @@ object WeTypeHostLauncher {
             ModuleBridgeContract.settingsBridgePendingIntent(activity.intent)
         )
 
-        val moduleContext = runCatching {
-            activity.createPackageContext(
-                MODULE_PACKAGE_NAME,
-                Context.CONTEXT_IGNORE_SECURITY or Context.CONTEXT_INCLUDE_CODE
-            )
-        }.getOrElse {
-            Log.e("Failed:Create module package context for WeType host dialog")
-            Log.i(it)
-            createEmbeddedModuleContext(activity)
-                ?: return
+        /*
+         * 2026-08-26
+         * Change type: fix
+         * What: NPatch 内嵌模式优先从本次嵌入并解压的模块 APK 创建资源 Context，独立模式仍使用已安装模块包。
+         * Why: 设备若同时安装了同包名但不同版本的 LSPosed 模块，createPackageContext 会成功却加载错误版本资源。
+         * Params & return: 输入当前宿主 Activity；返回与当前运行代码同源的模块 Context，失败时不打开设置对话框。
+         * Impact scope: 微信输入法内寄生设置的 Compose 资源、字体与主题；图片选择和设置保存逻辑不变。
+         * Risk: 内嵌模块解压路径失效时设置入口无法打开，并记录明确错误；宿主原页面不受影响。
+         */
+        val moduleContext = if (ModuleRuntime.isEmbeddedHostMode()) {
+            createEmbeddedModuleContext(activity) ?: return
+        } else {
+            runCatching {
+                activity.createPackageContext(
+                    MODULE_PACKAGE_NAME,
+                    Context.CONTEXT_IGNORE_SECURITY or Context.CONTEXT_INCLUDE_CODE
+                )
+            }.getOrElse {
+                Log.e("Failed:Create module package context for WeType host dialog")
+                Log.i(it)
+                createEmbeddedModuleContext(activity) ?: return
+            }
         }
 
         val dialog = ComponentDialog(

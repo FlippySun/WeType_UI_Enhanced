@@ -13,6 +13,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import com.xposed.wetypehook.ModuleBridgeContract
+import com.xposed.wetypehook.ModuleRuntime
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 
@@ -166,7 +167,10 @@ object WeTypeSettings {
         val appContext = context.applicationContext ?: context
         val localPreferences = appPreferences(appContext)
         val localSnapshot = localPreferences.toSnapshotOrNull()
-        if (appContext.packageName == MODULE_PACKAGE_NAME) {
+        if (
+            appContext.packageName == MODULE_PACKAGE_NAME ||
+            appContext.packageName == WETYPE_PACKAGE_NAME && ModuleRuntime.isEmbeddedHostMode()
+        ) {
             synchronizeRemotePreferences(appContext)
             return
         }
@@ -203,18 +207,35 @@ object WeTypeSettings {
         }
     }
 
+    /*
+     * 2026-08-26
+     * Change type: add
+     * What: 让 NPatch 内嵌宿主复用独立模块现有的本地偏好与 API 102 RemotePreferences 直写和重试路径。
+     * Why: 内嵌模块没有 com.xposed.wetypehook 独立安装包，原显式广播与 ACK 链路必然超时；复用既有同步逻辑可避免维护第二套协议。
+     * Params & return: synchronizeRemotePreferences 接收模块或微信输入法 Context；无返回值，结果写入本地、远端和进程缓存。
+     * Impact scope: Application.attach、输入法启动和寄生设置保存；独立模块同步与非内嵌桥接逻辑保持不变。
+     * Risk: writer 暂时不可用时仅加载已有宿主快照；新的保存会明确失败，避免跨进程状态不一致或背景文件丢失。
+     */
     fun synchronizeRemotePreferences(context: Context) {
         val appContext = context.applicationContext ?: context
-        if (appContext.packageName != MODULE_PACKAGE_NAME) return
+        val isEmbeddedWeType = appContext.packageName == WETYPE_PACKAGE_NAME &&
+            ModuleRuntime.isEmbeddedHostMode()
+        if (appContext.packageName != MODULE_PACKAGE_NAME && !isEmbeddedWeType) return
         synchronized(settingsSyncLock) {
             synchronizeRemotePreferencesLocked(appContext)
         }
     }
 
     private fun synchronizeRemotePreferencesLocked(context: Context) {
-        val remote = remotePreferences ?: return
         val localPreferences = appPreferences(context)
         val localSnapshot = localPreferences.toSnapshotOrNull()
+        val remote = remotePreferences
+        if (remote == null) {
+            if (ModuleRuntime.isEmbeddedHostMode()) {
+                cachedXposedSnapshot = localSnapshot ?: defaultSnapshot()
+            }
+            return
+        }
         val remoteSnapshot = remote.toSnapshotOrNull()
         val pending = localPreferences.getBoolean(KEY_REMOTE_SYNC_PENDING, false)
         when {
@@ -224,7 +245,9 @@ object WeTypeSettings {
                 if (synced) {
                     localPreferences.edit().putBoolean(KEY_REMOTE_SYNC_PENDING, false).commit()
                 }
-                if (synced) cachedXposedSnapshot = localSnapshot
+                if (synced || ModuleRuntime.isEmbeddedHostMode()) {
+                    cachedXposedSnapshot = localSnapshot
+                }
             }
 
             remoteSnapshot == null && localSnapshot != null -> {
@@ -233,7 +256,9 @@ object WeTypeSettings {
                 if (synced) {
                     localPreferences.edit().putBoolean(KEY_REMOTE_SYNC_PENDING, false).commit()
                 }
-                if (synced) cachedXposedSnapshot = localSnapshot
+                if (synced || ModuleRuntime.isEmbeddedHostMode()) {
+                    cachedXposedSnapshot = localSnapshot
+                }
             }
 
             remoteSnapshot != null -> {
@@ -419,11 +444,16 @@ object WeTypeSettings {
         )
         val appContext = context.applicationContext ?: context
         val localPreferences = appPreferences(appContext)
-        return if (appContext.packageName == MODULE_PACKAGE_NAME) {
+        val isEmbeddedWeType = appContext.packageName == WETYPE_PACKAGE_NAME &&
+            ModuleRuntime.isEmbeddedHostMode()
+        val writesPreferencesDirectly = appContext.packageName == MODULE_PACKAGE_NAME ||
+            isEmbeddedWeType
+        return if (writesPreferencesDirectly) {
             val persisted = synchronized(settingsSyncLock) {
                 val synced = remotePreferences?.let { preferences ->
                     runCatching { writeSnapshot(preferences, snapshot) }.getOrDefault(false)
                 } ?: false
+                if (isEmbeddedWeType && !synced) return@synchronized false
                 writeSnapshot(localPreferences, snapshot) { editor ->
                     editor.putBoolean(KEY_REMOTE_SYNC_PENDING, !synced)
                 }.also { saved ->
