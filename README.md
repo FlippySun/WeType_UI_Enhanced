@@ -68,6 +68,25 @@
 
 部分设置修改后需要重启微信输入法进程才能完全生效。
 
+### 微信输入法 3.5.2 内嵌版
+
+本分支兼容通过 NPatch 1.0.7 Canary 762 将模块嵌入微信输入法 3.5.2。打包时必须同时启用 `--injectdex`，确保模块进入微信输入法的 `:hld` 子进程；内嵌后可在微信输入法「关于」页点击 **插件与自定义背景** 进入寄生设置，无需另装模块或启用 LSPosed 作用域。稳定版 build 741 尚未向内嵌模块投递可写 XposedService，不能用于生成本修改版。
+
+```shell
+printf 'security.provider.13=org.bouncycastle.jce.provider.BouncyCastleProvider\n' > /tmp/npatch-bc.security
+java -Djava.security.properties=/tmp/npatch-bc.security \
+  -jar jar-v1.0.7-762-release.jar \
+  -m WeType_UI_Enhanced-1.29.0_release.apk \
+  --injectdex -npa -o output \
+  WeType-3.5.2-source.apk
+```
+
+本次本地产物的 SHA-256：微信输入法 3.5.2 输入包 `42366ddb0dc82cc46dc99567359048597be186810d45dbef7d22bd364a6805f1`，1.29.0 模块 `c6034cd162a32dd2f07467f3a24cddae2932213b5366af12a8aba2e9898fbf1a`，内嵌输出 `37e54c9c42e90032544698a2d022ca378b4b526fa2864add9302249552f6336c`。
+
+仓库仅提供 AGPL-3.0 模块源码，不提交或分发腾讯原始 APK 与合并后的安装包。修改版 APK 的签名必然不同于腾讯官方签名，普通设备无法直接覆盖官方版本；操作前应备份输入法数据，并根据设备的签名校验能力选择安装方式。
+
+本次内嵌包仅完成构建与静态校验，未在设备上安装或启动，也未验证 `:hld` 运行日志、入口点击、选图保存和输入法进程重启。NPatch 写包结果可通过 `unzip` 与 APK v2 签名校验，但 Android 构建工具仍会报告 ZIP header/GPB flag warning，严格安装器的兼容性需在目标设备确认。下方测试环境仅对应独立模块，不覆盖微信输入法 3.5.2 内嵌包。
+
 ## 测试环境
 
 设备：Xiaomi 17 Pro
